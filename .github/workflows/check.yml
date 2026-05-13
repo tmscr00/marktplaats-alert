@@ -1,0 +1,51 @@
+name: Marktplaats alert
+
+on:
+  schedule:
+    # Every 5 minutes — GitHub Actions' minimum interval on free tier.
+    # Note: scheduled runs can be delayed by several minutes during high load.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}  # also lets you trigger manually from the Actions tab
+
+# Prevent overlapping runs (e.g. if a check is slow).
+concurrency:
+  group: marktplaats-alert
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # needed to commit seen.json back to the repo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run checker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python check.py
+
+      - name: Commit updated seen.json
+        run: |
+          if [[ -n "$(git status --porcelain seen.json)" ]]; then
+            git config user.name  "marktplaats-bot"
+            git config user.email "marktplaats-bot@users.noreply.github.com"
+            git add seen.json
+            git commit -m "update seen.json [skip ci]"
+            # Retry once on a race with a parallel/late run.
+            git pull --rebase || true
+            git push
+          else
+            echo "No changes to commit."
+          fi
