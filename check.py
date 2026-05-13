@@ -177,7 +177,7 @@ DUTCH_MONTHS = {
 
 
 def is_real_new(listing: dict) -> bool:
-    """First-pass filter: reject Admarkt + Dagtopper + paid traits."""
+    """Reject paid/promoted ads + anything not showing as posted today."""
     item_id = str(listing.get("itemId") or "")
     if not item_id.startswith("m"):
         return False
@@ -192,6 +192,14 @@ def is_real_new(listing: dict) -> bool:
         "TOPADVERTENTIE", "PROFILE",
     }
     if any(t in bad_traits for t in traits):
+        return False
+
+    # Listing must show as "Vandaag" in the page-data date field. The
+    # offeredSince=Vandaag URL filter is sloppy and includes bumped older
+    # ads, but the per-listing date field is reliable when combined with
+    # the paid-ad filters above.
+    date_str = (listing.get("date") or "").strip().lower()
+    if date_str != "vandaag":
         return False
 
     return True
@@ -366,56 +374,31 @@ def one_check() -> int:
           f"filtered-as-paid: {filtered_out}, "
           f"candidates-for-verify: {len(new_listings)}")
 
-    # No more "silent first run" — if seen.json is empty/missing, treat that
-    # the same as a normal run. Today's listings still go through verify_today,
-    # so genuine new ones DO trigger Telegram instead of being silently
-    # absorbed. Non-today listings still get added to seen (via verify
-    # returning "not_today") so they won't fire later either.
+    # No more "silent first run" — if seen.json is empty/missing, just send
+    # alerts for everything that qualifies. is_real_new() already restricts
+    # to today's organic listings.
     if first_run:
-        print("  first run — will verify all candidates (no silent seeding).")
+        print("  first run — alerting on everything that qualifies (no silent seeding).")
 
     new_listings.reverse()
     if len(new_listings) > MAX_ALERTS_PER_RUN:
+        print(f"  capping {len(new_listings)} candidates to {MAX_ALERTS_PER_RUN}")
         new_listings = new_listings[-MAX_ALERTS_PER_RUN:]
 
-    # Second-pass: verify each candidate was actually posted TODAY by
-    # looking at its own listing page.
-    verified = []
-    confirmed_not_today = []  # safe to mark as seen permanently
-    transient_failures = []   # NOT marked seen — we'll retry next run
+    # Mark everything as seen and send the alerts.
     for l in new_listings:
-        result = verify_posted_today(l)
-        if result == "today":
-            verified.append(l)
-        elif result == "not_today":
-            confirmed_not_today.append(str(l.get("itemId")))
-        else:  # "error"
-            transient_failures.append(str(l.get("itemId")))
-
-    # Persist: alerted + confirmed-not-today go into seen.json.
-    # Transient failures are left out, so they're retried on the next run.
-    for l in verified:
         seen.append(str(l.get("itemId")))
-    seen.extend(confirmed_not_today)
 
-    if verified:
-        print(f"  📨 sending {len(verified)} alert(s) "
-              f"(of {len(new_listings)} candidates; "
-              f"{len(confirmed_not_today)} were not today, "
-              f"{len(transient_failures)} retrying next run)")
-        for l in verified:
+    if new_listings:
+        print(f"  📨 sending {len(new_listings)} alert(s)")
+        for l in new_listings:
             ok = tg_send(format_message(l))
             print(f"     - {l.get('itemId')} {'✅' if ok else '❌'} {l.get('title','')[:50]}")
     else:
-        if new_listings:
-            print(f"  {len(new_listings)} candidates but none verified as today "
-                  f"({len(confirmed_not_today)} not today, "
-                  f"{len(transient_failures)} retrying next run)")
-        else:
-            print("  nothing new")
+        print("  nothing new")
 
     save_seen(seen)
-    return len(verified)
+    return len(new_listings)
 
 
 def run_test_mode() -> int:
