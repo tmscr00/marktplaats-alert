@@ -329,17 +329,27 @@ def one_check() -> int:
     seen_set = set(seen)
 
     new_listings = []
+    seen_already = 0
+    filtered_out = 0
     for l in listings:
         item_id = str(l.get("itemId") or "")
-        if not item_id or item_id in seen_set:
+        if not item_id:
+            continue
+        if item_id in seen_set:
+            seen_already += 1
             continue
         if not is_real_new(l):
+            filtered_out += 1
             seen.append(item_id)
             seen_set.add(item_id)
             continue
         new_listings.append(l)
         seen.append(item_id)
         seen_set.add(item_id)
+
+    print(f"  seen-already: {seen_already}, "
+          f"filtered-as-paid: {filtered_out}, "
+          f"candidates-for-verify: {len(new_listings)}")
 
     if first_run:
         print("  first run — seeding seen.json without sending alerts.")
