@@ -1,34 +1,41 @@
 """
 Marktplaats new-listing alerter.
 
-Loads the same HTML page a browser would and parses the embedded JSON state
-Marktplaats injects into every page, so whatever filters work in your
-browser URL work here.
+Loads the listing page HTML, parses embedded JSON state, filters out
+paid/promoted ads, dedupes against seen.json, pings Telegram on new items.
 
-Two run modes:
-  - default          : real-monitor mode (only alerts on truly new listings)
-  - --test           : force-alert on the most recent listing right now,
-                       regardless of seen.json. Use this to verify the
-                       Telegram pipe end-to-end without waiting.
+Modes:
+  default            : check the first 3 pages once, then exit
+  --test             : send a test Telegram for the first organic listing
+  --loop N           : run repeatedly for N minutes, checking every 60s.
+                       (Used by the GitHub Actions workflow to keep checks
+                       coming even when the scheduler is slow.)
 """
 
 import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import requests
 
 # --- CONFIG -----------------------------------------------------------------
 
-TARGET_URL = (
+# Page 1, 2, 3 — Marktplaats's filter sort isn't strictly newest-first, so we
+# scan multiple pages and let seen.json handle dedup.
+TARGET_URLS = [
     "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/"
-    "?offeredSince=Vandaag&postcode=1033SC"
-)
+    "?offeredSince=Vandaag&postcode=1033SC",
+    "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/p/2/"
+    "?offeredSince=Vandaag&postcode=1033SC",
+    "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/p/3/"
+    "?offeredSince=Vandaag&postcode=1033SC",
+]
 
 SEEN_FILE = Path("seen.json")
-MAX_SEEN = 500
+MAX_SEEN = 1000
 MAX_ALERTS_PER_RUN = 15
 
 HEADERS = {
@@ -56,10 +63,8 @@ TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID")
 
 
 def tg_send(text: str) -> bool:
-    """Returns True on success."""
     if not TG_TOKEN or not TG_CHAT:
-        print("WARN: Telegram secrets not set; would have sent:")
-        print(text)
+        print("WARN: Telegram secrets not set")
         return False
     try:
         r = requests.post(
@@ -75,7 +80,6 @@ def tg_send(text: str) -> bool:
         if not r.ok:
             print(f"Telegram error {r.status_code}: {r.text}")
             return False
-        print(f"Telegram OK ({r.status_code})")
         return True
     except requests.RequestException as e:
         print(f"Telegram exception: {e}")
@@ -85,15 +89,15 @@ def tg_send(text: str) -> bool:
 # --- LISTING FETCH ----------------------------------------------------------
 
 
-def fetch_listings_from_page() -> list[dict]:
-    r = requests.get(TARGET_URL, headers=HEADERS, timeout=25)
-    if not r.ok:
-        print(f"HTTP {r.status_code} from page fetch")
-        print(f"Response body (first 600 chars):\n{r.text[:600]}")
+def fetch_page(url: str) -> list[dict]:
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=25)
         r.raise_for_status()
+    except requests.RequestException as e:
+        print(f"  fetch failed for {url}: {e}")
+        return []
 
     html = r.text
-    print(f"Got {len(html)} bytes of HTML")
 
     m = re.search(r"window\.__CONFIG__\s*=\s*({.+?})\s*;\s*</script>", html, re.DOTALL)
     if m:
@@ -101,36 +105,39 @@ def fetch_listings_from_page() -> list[dict]:
             cfg = json.loads(m.group(1))
             listings = _find_listings_in(cfg)
             if listings:
-                print(f"Extracted {len(listings)} listings from __CONFIG__")
                 return listings
-        except json.JSONDecodeError as e:
-            print(f"__CONFIG__ JSON decode failed: {e}")
+        except json.JSONDecodeError:
+            pass
 
-    m = re.search(
-        r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.+?)</script>', html, re.DOTALL
-    )
+    m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.+?)</script>', html, re.DOTALL)
     if m:
         try:
             cfg = json.loads(m.group(1))
             listings = _find_listings_in(cfg)
             if listings:
-                print(f"Extracted {len(listings)} listings from __NEXT_DATA__")
-                return listings
-        except json.JSONDecodeError as e:
-            print(f"__NEXT_DATA__ JSON decode failed: {e}")
-
-    m = re.search(r'"listings"\s*:\s*(\[[^\[\]]*?\{.+?\}\s*\])', html, re.DOTALL)
-    if m:
-        try:
-            listings = json.loads(m.group(1))
-            if isinstance(listings, list) and listings:
-                print(f"Extracted {len(listings)} listings via regex fallback")
                 return listings
         except json.JSONDecodeError:
             pass
 
-    print("Could not locate listings JSON in the page.")
     return []
+
+
+def fetch_all_listings() -> list[dict]:
+    """Fetch all configured pages and merge, deduped by itemId."""
+    seen_ids = set()
+    out = []
+    for url in TARGET_URLS:
+        page_listings = fetch_page(url)
+        kept = 0
+        for l in page_listings:
+            iid = str(l.get("itemId") or "")
+            if iid and iid not in seen_ids:
+                seen_ids.add(iid)
+                out.append(l)
+                kept += 1
+        print(f"  page {url.split('/p/')[1].split('/')[0] if '/p/' in url else '1'}: "
+              f"{len(page_listings)} listings, {kept} new this fetch")
+    return out
 
 
 def _find_listings_in(obj):
@@ -151,25 +158,18 @@ def _find_listings_in(obj):
     return None
 
 
-def is_real_new(listing: dict) -> bool:
-    """
-    Return True only if the listing looks like a normal organic post.
+# --- FILTER -----------------------------------------------------------------
 
-    Rejects:
-      - Admarkt paid ads: itemId starts with 'a' (real ads start with 'm'),
-        and/or traits contain 'ADMARKT_*' tokens
-      - Dagtopper / Topadvertentie bumps: priorityProduct != NONE
-      - PACKAGE_PREMIUM / PACKAGE_PLUS — these are paid seller subscriptions
-        that always promote your listing; usually accompany DAGTOPPER but we
-        check separately as a safety net
-    """
+
+def is_real_new(listing: dict) -> bool:
+    """Reject Admarkt + Dagtopper + Topadvertentie + anything tagged paid."""
     item_id = str(listing.get("itemId") or "")
     if not item_id.startswith("m"):
-        return False  # 'a...' = Admarkt, anything else = unknown, reject
+        return False
 
     pp = listing.get("priorityProduct", "NONE")
     if pp not in ("NONE", None, ""):
-        return False  # DAGTOPPER, TOPADVERTENTIE, etc.
+        return False
 
     traits = listing.get("traits") or []
     bad_traits = {
@@ -180,6 +180,9 @@ def is_real_new(listing: dict) -> bool:
         return False
 
     return True
+
+
+# --- FORMAT -----------------------------------------------------------------
 
 
 def listing_url(listing: dict) -> str:
@@ -250,49 +253,22 @@ def save_seen(ids: list[str]) -> None:
     SEEN_FILE.write_text(json.dumps(ids[-MAX_SEEN:], indent=2))
 
 
-# --- MAIN -------------------------------------------------------------------
+# --- RUN MODES --------------------------------------------------------------
 
 
-def run_test_mode(listings: list[dict]) -> int:
-    """
-    Find the first listing that survives the (now stricter) filter and
-    send it via Telegram, regardless of seen.json state. Use this to
-    verify both Telegram delivery AND that the paid-ad filter works.
-    """
-    print("=== TEST MODE ===")
-    print(f"Telegram token set: {bool(TG_TOKEN)}")
-    print(f"Telegram chat set:  {bool(TG_CHAT)}")
+def one_check() -> int:
+    """One full check: fetch all pages, alert on new, save seen.json. Returns count alerted."""
+    print(f"[{time.strftime('%H:%M:%S')}] fetching...")
+    listings = fetch_all_listings()
+    print(f"  total unique listings across pages: {len(listings)}")
 
-    # Show what's being filtered so we can see the filter in action.
-    print("\nFilter walk-through:")
-    target = None
-    for i, l in enumerate(listings):
-        item_id = str(l.get("itemId") or "")
-        pp = l.get("priorityProduct", "NONE")
-        traits = l.get("traits") or []
-        ok = is_real_new(l)
-        status = "✅ KEEP" if ok else "❌ skip"
-        print(f"  {i+1:2d}. {status}  id={item_id}  pp={pp}  traits={traits[:3]}")
-        if ok and target is None:
-            target = l
+    if not listings:
+        print("  no listings returned — skipping this check")
+        return 0
 
-    if not target:
-        print("\nNo organic listings on this page right now (everything is "
-              "paid/promoted). Try again in a few minutes.")
-        return 1
-
-    print(f"\nSending test alert for itemId={target.get('itemId')}")
-    ok = tg_send(format_message(target, prefix="🧪 TEST:"))
-    return 0 if ok else 1
-
-
-def run_normal_mode(listings: list[dict]) -> int:
     first_run = not SEEN_FILE.exists()
-    print(f"first_run={first_run}, seen.json exists={SEEN_FILE.exists()}")
-
     seen = load_seen()
     seen_set = set(seen)
-    print(f"Loaded {len(seen)} IDs from seen.json")
 
     new_listings = []
     for l in listings:
@@ -308,42 +284,88 @@ def run_normal_mode(listings: list[dict]) -> int:
         seen_set.add(item_id)
 
     if first_run:
-        print("First run — seeding seen.json without sending alerts.")
+        print("  first run — seeding seen.json without sending alerts.")
         save_seen(seen)
         return 0
 
     new_listings.reverse()
-
     if len(new_listings) > MAX_ALERTS_PER_RUN:
-        print(f"Capping {len(new_listings)} new listings to {MAX_ALERTS_PER_RUN}")
         new_listings = new_listings[-MAX_ALERTS_PER_RUN:]
 
-    print(f"Sending {len(new_listings)} alert(s)")
-    for l in new_listings:
-        tg_send(format_message(l))
+    if new_listings:
+        print(f"  📨 sending {len(new_listings)} alert(s)")
+        for l in new_listings:
+            ok = tg_send(format_message(l))
+            print(f"     - {l.get('itemId')} {'✅' if ok else '❌'} {l.get('title','')[:50]}")
+    else:
+        print("  nothing new")
 
     save_seen(seen)
+    return len(new_listings)
+
+
+def run_test_mode() -> int:
+    print("=== TEST MODE ===")
+    listings = fetch_all_listings()
+    if not listings:
+        print("no listings.")
+        return 1
+    print(f"\nFilter walk-through ({len(listings)} listings):")
+    target = None
+    for i, l in enumerate(listings):
+        ok = is_real_new(l)
+        status = "✅ KEEP" if ok else "❌ skip"
+        print(f"  {i+1:2d}. {status}  id={l.get('itemId')}  "
+              f"pp={l.get('priorityProduct')}  traits={(l.get('traits') or [])[:3]}")
+        if ok and target is None:
+            target = l
+    if not target:
+        print("\nNo organic listings on these pages right now.")
+        return 1
+    print(f"\nSending test alert for itemId={target.get('itemId')}")
+    ok = tg_send(format_message(target, prefix="🧪 TEST:"))
+    return 0 if ok else 1
+
+
+def run_loop_mode(minutes: int) -> int:
+    """Check every 60 seconds for `minutes` minutes."""
+    print(f"=== LOOP MODE: {minutes} minutes, checking every 60s ===")
+    end = time.time() + minutes * 60
+    checks = 0
+    total_alerts = 0
+    while time.time() < end:
+        checks += 1
+        print(f"\n--- check #{checks} ---")
+        try:
+            total_alerts += one_check()
+        except Exception as e:
+            print(f"  check failed: {e}")
+        # Don't sleep past the end time
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(60, remaining))
+    print(f"\n=== loop done: {checks} checks, {total_alerts} alerts sent ===")
     return 0
 
 
+# --- MAIN -------------------------------------------------------------------
+
+
 def main() -> int:
-    test_mode = "--test" in sys.argv
+    if "--test" in sys.argv:
+        return run_test_mode()
 
-    try:
-        listings = fetch_listings_from_page()
-    except Exception as e:
-        print(f"Fetch failed: {e}")
-        return 1
+    if "--loop" in sys.argv:
+        i = sys.argv.index("--loop")
+        try:
+            minutes = int(sys.argv[i + 1])
+        except (IndexError, ValueError):
+            minutes = 4
+        return run_loop_mode(minutes)
 
-    if not listings:
-        print("No listings extracted; aborting.")
-        return 1
-
-    print(f"Working with {len(listings)} listings")
-
-    if test_mode:
-        return run_test_mode(listings)
-    return run_normal_mode(listings)
+    one_check()
+    return 0
 
 
 if __name__ == "__main__":
