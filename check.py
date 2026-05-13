@@ -197,19 +197,19 @@ def is_real_new(listing: dict) -> bool:
     return True
 
 
-def verify_posted_today(listing: dict) -> bool:
+def verify_posted_today(listing: dict) -> str:
     """
-    Second-pass filter: fetch the listing's own page and read the
-    'Sinds DD mmm '26' line. The page-list 'date' field shows when an
-    ad was last bumped, not posted, so we can't trust it. Returns True
-    only if the listing's actual creation date is today.
+    Second-pass filter. Returns one of:
+      "today"     — confirmed posted today, ALERT
+      "not_today" — confirmed posted on a prior day, skip permanently
+      "error"     — could not determine, leave out of seen.json and retry
 
-    One HTTP request per genuinely-new listing (after seen.json dedup),
-    so cost is small.
+    Reads the listing's own page for the 'Sinds DD mmm '26' line, since
+    the page-list 'date' field shows last-bumped date, not post date.
     """
     vip = listing.get("vipUrl") or ""
     if not vip:
-        return False
+        return "error"
     url = vip if vip.startswith("http") else f"https://www.marktplaats.nl{vip}"
 
     try:
@@ -217,13 +217,12 @@ def verify_posted_today(listing: dict) -> bool:
         r.raise_for_status()
     except requests.RequestException as e:
         print(f"     verify-date fetch failed for {listing.get('itemId')}: {e}")
-        return False
+        return "error"
 
-    # Look for "Sinds 12 mei '26" or "Sinds 12 mei 2026"
     m = re.search(r"Sinds\s+(\d{1,2})\s+([a-z]{3,4})\s+'?(\d{2,4})", r.text, re.IGNORECASE)
     if not m:
         print(f"     verify-date: could not find 'Sinds' line for {listing.get('itemId')}")
-        return False
+        return "error"
 
     day = int(m.group(1))
     month_name = m.group(2).lower()[:3]
@@ -232,20 +231,17 @@ def verify_posted_today(listing: dict) -> bool:
     month = DUTCH_MONTHS.get(month_name)
     if month is None:
         print(f"     verify-date: unknown month '{month_name}' for {listing.get('itemId')}")
-        return False
+        return "error"
 
-    # Compare with today (in NL local time = UTC+1 or +2; use UTC since the
-    # difference doesn't matter on the day boundary unless we run at midnight,
-    # and we just check the date once anyway).
     from datetime import datetime, timezone, timedelta
-    nl_now = datetime.now(timezone.utc) + timedelta(hours=2)  # CEST in May
+    nl_now = datetime.now(timezone.utc) + timedelta(hours=2)
     today = (nl_now.year, nl_now.month, nl_now.day)
     listing_date = (year, month, day)
-    is_today = listing_date == today
-    if not is_today:
-        print(f"     verify-date: {listing.get('itemId')} posted "
-              f"{listing_date}, not today {today} — skipping")
-    return is_today
+    if listing_date == today:
+        return "today"
+    print(f"     verify-date: {listing.get('itemId')} posted "
+          f"{listing_date}, not today {today} — skipping")
+    return "not_today"
 
 
 # --- FORMAT -----------------------------------------------------------------
@@ -344,6 +340,7 @@ def one_check() -> int:
     seen_set = set(seen)
 
     new_listings = []
+    candidate_ids = []  # track these separately so we can add to seen only after alerting
     seen_already = 0
     filtered_out = 0
     for l in listings:
@@ -354,13 +351,16 @@ def one_check() -> int:
             seen_already += 1
             continue
         if not is_real_new(l):
+            # Paid/promoted ads are safe to permanently mark as seen.
             filtered_out += 1
             seen.append(item_id)
             seen_set.add(item_id)
             continue
+        # Candidate for alerting. We will ONLY add to seen.json after we've
+        # decided what to do with it (alert or verify-reject), so transient
+        # errors don't permanently poison seen.json.
         new_listings.append(l)
-        seen.append(item_id)
-        seen_set.add(item_id)
+        candidate_ids.append(item_id)
 
     print(f"  seen-already: {seen_already}, "
           f"filtered-as-paid: {filtered_out}, "
@@ -368,6 +368,8 @@ def one_check() -> int:
 
     if first_run:
         print("  first run — seeding seen.json without sending alerts.")
+        # On first run, also seed the candidates so we don't spam later.
+        seen.extend(candidate_ids)
         save_seen(seen)
         return 0
 
@@ -376,21 +378,38 @@ def one_check() -> int:
         new_listings = new_listings[-MAX_ALERTS_PER_RUN:]
 
     # Second-pass: verify each candidate was actually posted TODAY by
-    # looking at its own listing page (the page-list date is when it was
-    # last bumped, not when posted, so we can't trust it).
+    # looking at its own listing page.
     verified = []
+    confirmed_not_today = []  # safe to mark as seen permanently
+    transient_failures = []   # NOT marked seen — we'll retry next run
     for l in new_listings:
-        if verify_posted_today(l):
+        result = verify_posted_today(l)
+        if result == "today":
             verified.append(l)
+        elif result == "not_today":
+            confirmed_not_today.append(str(l.get("itemId")))
+        else:  # "error"
+            transient_failures.append(str(l.get("itemId")))
+
+    # Persist: alerted + confirmed-not-today go into seen.json.
+    # Transient failures are left out, so they're retried on the next run.
+    for l in verified:
+        seen.append(str(l.get("itemId")))
+    seen.extend(confirmed_not_today)
 
     if verified:
-        print(f"  📨 sending {len(verified)} alert(s) (of {len(new_listings)} candidates)")
+        print(f"  📨 sending {len(verified)} alert(s) "
+              f"(of {len(new_listings)} candidates; "
+              f"{len(confirmed_not_today)} were not today, "
+              f"{len(transient_failures)} retrying next run)")
         for l in verified:
             ok = tg_send(format_message(l))
             print(f"     - {l.get('itemId')} {'✅' if ok else '❌'} {l.get('title','')[:50]}")
     else:
         if new_listings:
-            print(f"  {len(new_listings)} new-to-us listings but none verified as posted today")
+            print(f"  {len(new_listings)} candidates but none verified as today "
+                  f"({len(confirmed_not_today)} not today, "
+                  f"{len(transient_failures)} retrying next run)")
         else:
             print("  nothing new")
 
