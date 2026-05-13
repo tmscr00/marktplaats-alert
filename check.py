@@ -25,22 +25,35 @@ import requests
 
 # Page 1, 2, 3 — Marktplaats's filter sort isn't strictly newest-first, so we
 # scan multiple pages and let seen.json handle dedup.
-TARGET_URLS = [
-    # We scan more pages because Marktplaats's default sort isn't strictly
-    # newest-first — a genuinely new ad can appear anywhere in the results.
-    # Adding the sortBy parameter that the website's "Datum nieuwste"
-    # selector uses, so the first results are actually the newest.
-    "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/"
-    "?offeredSince=Vandaag&sortBy=SORT_INDEX&sortOrder=DECREASING",
-    "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/p/2/"
-    "?offeredSince=Vandaag&sortBy=SORT_INDEX&sortOrder=DECREASING",
-    "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/p/3/"
-    "?offeredSince=Vandaag&sortBy=SORT_INDEX&sortOrder=DECREASING",
-    "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/p/4/"
-    "?offeredSince=Vandaag&sortBy=SORT_INDEX&sortOrder=DECREASING",
-    "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/p/5/"
-    "?offeredSince=Vandaag&sortBy=SORT_INDEX&sortOrder=DECREASING",
+# Each category has a label/emoji (for Telegram), a base URL path on
+# Marktplaats, and the number of pages to scan. To add another category
+# later, just append another dict.
+CATEGORIES = [
+    {
+        "label": "Camera",
+        "emoji": "📸",
+        "base": "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/",
+        "pages": 5,
+    },
+    {
+        "label": "iPod",
+        "emoji": "🎧",
+        "base": "https://www.marktplaats.nl/l/audio-tv-en-foto/mp3-spelers-apple-ipod/",
+        "pages": 3,  # smaller category, fewer pages needed
+    },
 ]
+
+
+def build_urls(category: dict) -> list[str]:
+    """Build page-1..N URLs for a category."""
+    base = category["base"]
+    n = category["pages"]
+    urls = [f"{base}?offeredSince=Vandaag&sortBy=SORT_INDEX&sortOrder=DECREASING"]
+    for i in range(2, n + 1):
+        urls.append(
+            f"{base}p/{i}/?offeredSince=Vandaag&sortBy=SORT_INDEX&sortOrder=DECREASING"
+        )
+    return urls
 
 SEEN_FILE = Path("seen.json")
 MAX_SEEN = 1000
@@ -130,21 +143,27 @@ def fetch_page(url: str) -> list[dict]:
     return []
 
 
-def fetch_all_listings() -> list[dict]:
-    """Fetch all configured pages and merge, deduped by itemId."""
+def fetch_all_listings(category: dict) -> list[dict]:
+    """Fetch all pages for one category and merge, deduped by itemId.
+
+    Tags each listing with `_category` so downstream code knows which
+    emoji/label to use when formatting Telegram messages.
+    """
     seen_ids = set()
     out = []
-    for url in TARGET_URLS:
+    for url in build_urls(category):
         page_listings = fetch_page(url)
         kept = 0
         for l in page_listings:
             iid = str(l.get("itemId") or "")
             if iid and iid not in seen_ids:
                 seen_ids.add(iid)
+                l["_category"] = category  # tag for later formatting
                 out.append(l)
                 kept += 1
         page_label = url.split('/p/')[1].split('/')[0] if '/p/' in url else '1'
-        print(f"  page {page_label}: {len(page_listings)} listings, {kept} unique-this-fetch")
+        print(f"    [{category['label']}] page {page_label}: "
+              f"{len(page_listings)} listings, {kept} unique-this-fetch")
     return out
 
 
@@ -287,7 +306,7 @@ def escape_html(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def format_message(listing: dict, prefix: str = "📸") -> str:
+def format_message(listing: dict, prefix: str | None = None) -> str:
     title = escape_html(listing.get("title", "(geen titel)"))
     price = escape_html(price_text(listing))
     loc = escape_html(
@@ -299,8 +318,18 @@ def format_message(listing: dict, prefix: str = "📸") -> str:
         (listing.get("sellerInformation", {}) or {}).get("sellerName", "—")
     )
     url = listing_url(listing)
+
+    # Pull category emoji+label from the tag we set in fetch_all_listings.
+    if prefix is None:
+        cat = listing.get("_category") or {}
+        emoji = cat.get("emoji", "📦")
+        label = cat.get("label", "")
+        header = f"{emoji} <b>{label}</b>: <b>{title}</b>" if label else f"{emoji} <b>{title}</b>"
+    else:
+        header = f"{prefix} <b>{title}</b>"
+
     return (
-        f"{prefix} <b>{title}</b>\n"
+        f"{header}\n"
         f"💶 {price}\n"
         f"📍 {loc}  ·  👤 {seller}\n"
         f"<a href=\"{url}\">Bekijk advertentie</a>"
@@ -327,28 +356,25 @@ def save_seen(ids: list[str]) -> None:
 
 
 def one_check() -> int:
-    """One full check: fetch all pages, alert on new, save seen.json. Returns count alerted."""
+    """One full check across all categories. Returns count alerted."""
     print(f"[{time.strftime('%H:%M:%S')}] fetching...")
-    listings = fetch_all_listings()
-    print(f"  total unique listings across pages: {len(listings)}")
+
+    # Fetch all categories, accumulating into one list.
+    listings: list[dict] = []
+    for cat in CATEGORIES:
+        print(f"  {cat['emoji']} {cat['label']}:")
+        listings.extend(fetch_all_listings(cat))
+    print(f"  total unique listings across categories: {len(listings)}")
 
     if not listings:
         print("  no listings returned — skipping this check")
         return 0
-
-    # Show the first 5 IDs from the fetch — useful for spotting whether
-    # new ads are reaching us at all, and which order Marktplaats serves them.
-    print("  first 5 listings on page 1 (by Marktplaats's sort order):")
-    for i, l in enumerate(listings[:5]):
-        print(f"    {i+1}. id={l.get('itemId')} pp={l.get('priorityProduct')} "
-              f"date={l.get('date')} title={l.get('title','')[:50]}")
 
     first_run = not SEEN_FILE.exists()
     seen = load_seen()
     seen_set = set(seen)
 
     new_listings = []
-    candidate_ids = []  # track these separately so we can add to seen only after alerting
     seen_already = 0
     filtered_out = 0
     for l in listings:
@@ -359,24 +385,16 @@ def one_check() -> int:
             seen_already += 1
             continue
         if not is_real_new(l):
-            # Paid/promoted ads are safe to permanently mark as seen.
             filtered_out += 1
             seen.append(item_id)
             seen_set.add(item_id)
             continue
-        # Candidate for alerting. We will ONLY add to seen.json after we've
-        # decided what to do with it (alert or verify-reject), so transient
-        # errors don't permanently poison seen.json.
         new_listings.append(l)
-        candidate_ids.append(item_id)
 
     print(f"  seen-already: {seen_already}, "
           f"filtered-as-paid: {filtered_out}, "
-          f"candidates-for-verify: {len(new_listings)}")
+          f"candidates: {len(new_listings)}")
 
-    # No more "silent first run" — if seen.json is empty/missing, just send
-    # alerts for everything that qualifies. is_real_new() already restricts
-    # to today's organic listings.
     if first_run:
         print("  first run — alerting on everything that qualifies (no silent seeding).")
 
@@ -403,7 +421,10 @@ def one_check() -> int:
 
 def run_test_mode() -> int:
     print("=== TEST MODE ===")
-    listings = fetch_all_listings()
+    listings = []
+    for cat in CATEGORIES:
+        print(f"  {cat['emoji']} {cat['label']}:")
+        listings.extend(fetch_all_listings(cat))
     if not listings:
         print("no listings.")
         return 1
