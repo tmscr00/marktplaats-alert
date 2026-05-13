@@ -26,12 +26,20 @@ import requests
 # Page 1, 2, 3 — Marktplaats's filter sort isn't strictly newest-first, so we
 # scan multiple pages and let seen.json handle dedup.
 TARGET_URLS = [
+    # We scan more pages because Marktplaats's default sort isn't strictly
+    # newest-first — a genuinely new ad can appear anywhere in the results.
+    # Adding the sortBy parameter that the website's "Datum nieuwste"
+    # selector uses, so the first results are actually the newest.
     "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/"
-    "?offeredSince=Vandaag&postcode=1033SC",
+    "?offeredSince=Vandaag&sortBy=SORT_INDEX&sortOrder=DECREASING",
     "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/p/2/"
-    "?offeredSince=Vandaag&postcode=1033SC",
+    "?offeredSince=Vandaag&sortBy=SORT_INDEX&sortOrder=DECREASING",
     "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/p/3/"
-    "?offeredSince=Vandaag&postcode=1033SC",
+    "?offeredSince=Vandaag&sortBy=SORT_INDEX&sortOrder=DECREASING",
+    "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/p/4/"
+    "?offeredSince=Vandaag&sortBy=SORT_INDEX&sortOrder=DECREASING",
+    "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/p/5/"
+    "?offeredSince=Vandaag&sortBy=SORT_INDEX&sortOrder=DECREASING",
 ]
 
 SEEN_FILE = Path("seen.json")
@@ -135,8 +143,8 @@ def fetch_all_listings() -> list[dict]:
                 seen_ids.add(iid)
                 out.append(l)
                 kept += 1
-        print(f"  page {url.split('/p/')[1].split('/')[0] if '/p/' in url else '1'}: "
-              f"{len(page_listings)} listings, {kept} new this fetch")
+        page_label = url.split('/p/')[1].split('/')[0] if '/p/' in url else '1'
+        print(f"  page {page_label}: {len(page_listings)} listings, {kept} unique-this-fetch")
     return out
 
 
@@ -323,6 +331,13 @@ def one_check() -> int:
     if not listings:
         print("  no listings returned — skipping this check")
         return 0
+
+    # Show the first 5 IDs from the fetch — useful for spotting whether
+    # new ads are reaching us at all, and which order Marktplaats serves them.
+    print("  first 5 listings on page 1 (by Marktplaats's sort order):")
+    for i, l in enumerate(listings[:5]):
+        print(f"    {i+1}. id={l.get('itemId')} pp={l.get('priorityProduct')} "
+              f"date={l.get('date')} title={l.get('title','')[:50]}")
 
     first_run = not SEEN_FILE.exists()
     seen = load_seen()
