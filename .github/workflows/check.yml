@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       test_mode:
-        description: "Send a test alert for the most recent listing (yes/no)"
+        description: "Send a test alert"
         required: false
         default: "no"
         type: choice
@@ -24,6 +24,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,12 +45,13 @@ jobs:
           if [[ "${{ inputs.test_mode }}" == "yes" ]]; then
             python check.py --test
           else
-            python check.py
+            # Run for ~4 minutes, checking every 60s.
+            # This way each scheduled trigger gives us many checks,
+            # making us resilient to GitHub Actions cron lag.
+            python check.py --loop 4
           fi
 
       - name: Commit updated seen.json
-        # Skip the commit step when running in test mode so it doesn't
-        # touch your seen.json state.
         if: ${{ inputs.test_mode != 'yes' }}
         run: |
           if [[ -n "$(git status --porcelain seen.json)" ]]; then
