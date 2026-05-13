@@ -1,8 +1,12 @@
 name: Marktplaats alert
 
 on:
+  # Backup GitHub schedule — in case cron-job.org ever fails, we still get
+  # a check every ~5-15 min (when GitHub feels like it).
   schedule:
     - cron: "*/5 * * * *"
+  # Primary trigger: cron-job.org will POST to GitHub's API every minute
+  # to trigger this workflow_dispatch event.
   workflow_dispatch:
     inputs:
       test_mode:
@@ -14,6 +18,8 @@ on:
           - "no"
           - "yes"
 
+# If a run is already in flight when the next trigger arrives, just skip
+# the new one. Keeps things sane if checks ever overlap.
 concurrency:
   group: marktplaats-alert
   cancel-in-progress: false
@@ -24,7 +30,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 3
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,10 +51,7 @@ jobs:
           if [[ "${{ inputs.test_mode }}" == "yes" ]]; then
             python check.py --test
           else
-            # Run for ~4 minutes, checking every 60s.
-            # This way each scheduled trigger gives us many checks,
-            # making us resilient to GitHub Actions cron lag.
-            python check.py --loop 4
+            python check.py
           fi
 
       - name: Commit updated seen.json
