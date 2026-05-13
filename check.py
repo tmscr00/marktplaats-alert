@@ -1,13 +1,19 @@
 """
 Marktplaats new-listing alerter.
 
-Polls the Marktplaats internal JSON API for a fixed search (digital cameras,
-postcode 1033SC, offeredSince=Vandaag), compares against a local seen-IDs
-file, and pushes Telegram notifications for genuinely new listings.
+Calls the Marktplaats internal JSON API (/lrp/api/search) with a minimal,
+known-good set of parameters and does all "organic only" filtering on the
+response in Python. This avoids fragility from guessing the API's exact
+filter param names.
 
-Filters out bumped / "dagtopper" / priority ads so we only alert on real
-new posts, which is exactly what the user wanted (Marktplaats's own sort
-mixes those in and is the reason new ads don't appear at the top).
+For each fetched listing we:
+  - drop bumped / dagtopper / priority ads (priorityProduct != NONE)
+  - skip anything we've already alerted on (seen.json)
+Then push the truly new ones to Telegram.
+
+Because we sort by recency on the API side (default) and the script runs
+every 5 minutes, we don't need a date filter — the seen-IDs file is what
+guarantees we only ever ping you about ads we haven't seen before.
 """
 
 import json
@@ -19,26 +25,19 @@ import requests
 
 # --- CONFIG -----------------------------------------------------------------
 
-# Tweak these freely. Built from the user's link:
+# Built from the user's link:
 # https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/#offeredSince:Vandaag|postcode:1033SC
 SEARCH_PARAMS = {
-    "l1CategoryId": 322,     # Audio, tv en foto
-    "l2CategoryId": 484,     # Fotocamera's | Digitaal
-    "postcode": "1033SC",
-    "offeredSince": "Vandaag",
+    "l1CategoryId": 322,   # Audio, tv en foto
+    "l2CategoryId": 484,   # Fotocamera's | Digitaal
     "limit": 30,
     "offset": 0,
-    "sortBy": "SORT_INDEX",
-    "sortOrder": "DECREASING",
 }
 
 API_URL = "https://www.marktplaats.nl/lrp/api/search"
 SEEN_FILE = Path("seen.json")
-MAX_SEEN = 500  # keep the file small; older IDs age out
-
-# Cap how many notifications we send in a single run. On the very first run
-# the seen-list is empty, so without this we'd spam every "today" listing.
-MAX_ALERTS_PER_RUN = 15
+MAX_SEEN = 500           # cap so seen.json stays small
+MAX_ALERTS_PER_RUN = 15  # safety cap on a single Telegram burst
 
 HEADERS = {
     "User-Agent": (
@@ -47,6 +46,7 @@ HEADERS = {
     ),
     "Accept": "application/json",
     "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
+    "Referer": "https://www.marktplaats.nl/",
 }
 
 # --- TELEGRAM ---------------------------------------------------------------
@@ -56,7 +56,6 @@ TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID")
 
 
 def tg_send(text: str) -> None:
-    """Send a Telegram message. Silently logs failures and continues."""
     if not TG_TOKEN or not TG_CHAT:
         print("WARN: Telegram secrets not set; would have sent:\n", text)
         return
@@ -81,7 +80,6 @@ def tg_send(text: str) -> None:
 
 
 def fetch_listings() -> list[dict]:
-    """Query the Marktplaats internal JSON API."""
     r = requests.get(API_URL, params=SEARCH_PARAMS, headers=HEADERS, timeout=20)
     r.raise_for_status()
     data = r.json()
@@ -89,20 +87,12 @@ def fetch_listings() -> list[dict]:
 
 
 def is_real_new(listing: dict) -> bool:
-    """
-    Skip bumped / paid-priority ads so we only alert on genuinely new posts.
-
-    Marktplaats marks bumped/priority ads via `priorityProduct` (e.g. "DAGTOPPER",
-    "TOPADVERTENTIE", "BASIC") and/or a non-empty `verticals`/`extendedAttributes`
-    indicating promotion. The safest signal is `priorityProduct`: only "NONE" (or
-    missing) is a normal organic ad.
-    """
+    """Skip bumped / paid-priority ads."""
     pp = listing.get("priorityProduct", "NONE")
     return pp in ("NONE", None, "")
 
 
 def listing_url(listing: dict) -> str:
-    """Build a full URL from the API's relative vipUrl."""
     vip = listing.get("vipUrl") or ""
     if vip.startswith("http"):
         return vip
@@ -115,7 +105,6 @@ def price_text(listing: dict) -> str:
     ptype = pi.get("priceType", "")
     if ptype == "FIXED" and cents is not None:
         return f"€{cents/100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    # Common non-fixed types: BIDDING, SEE_DESCRIPTION, RESERVED, FREE, ON_DEMAND, etc.
     mapping = {
         "BIDDING": "Bieden",
         "SEE_DESCRIPTION": "Zie omschrijving",
@@ -138,7 +127,7 @@ def format_message(listing: dict) -> str:
     price = escape_html(price_text(listing))
     loc = escape_html(
         (listing.get("location", {}) or {}).get("cityName", "")
-        or listing.get("sellerInformation", {}).get("sellerCity", "")
+        or (listing.get("sellerInformation", {}) or {}).get("sellerCity", "")
         or "—"
     )
     seller = escape_html(
@@ -166,7 +155,6 @@ def load_seen() -> list[str]:
 
 
 def save_seen(ids: list[str]) -> None:
-    # Trim to the most recent MAX_SEEN entries.
     SEEN_FILE.write_text(json.dumps(ids[-MAX_SEEN:], indent=2))
 
 
@@ -182,18 +170,17 @@ def main() -> int:
 
     print(f"Fetched {len(listings)} listings from API")
 
+    first_run = not SEEN_FILE.exists()
     seen = load_seen()
     seen_set = set(seen)
 
     new_listings = []
     for l in listings:
         item_id = str(l.get("itemId") or "")
-        if not item_id:
-            continue
-        if item_id in seen_set:
+        if not item_id or item_id in seen_set:
             continue
         if not is_real_new(l):
-            # Still mark as seen so we don't reconsider next run.
+            # Mark as seen so we don't reconsider next run, but don't alert.
             seen.append(item_id)
             seen_set.add(item_id)
             continue
@@ -201,18 +188,17 @@ def main() -> int:
         seen.append(item_id)
         seen_set.add(item_id)
 
-    # First-run protection: if seen.json was empty, don't spam every "today" ad.
-    first_run = len(seen) == len([l for l in listings if str(l.get("itemId") or "")])
-    if first_run and not SEEN_FILE.exists():
-        print("First run detected — seeding seen.json without sending alerts.")
+    # First-run protection: don't spam every ad currently on page 1.
+    if first_run:
+        print("First run — seeding seen.json without sending alerts.")
         save_seen(seen)
         return 0
 
-    # Oldest first, so notifications arrive in chronological order.
+    # Oldest first so notifications arrive chronologically.
     new_listings.reverse()
 
     if len(new_listings) > MAX_ALERTS_PER_RUN:
-        print(f"Capping {len(new_listings)} new listings down to {MAX_ALERTS_PER_RUN}")
+        print(f"Capping {len(new_listings)} new listings to {MAX_ALERTS_PER_RUN}")
         new_listings = new_listings[-MAX_ALERTS_PER_RUN:]
 
     print(f"Sending {len(new_listings)} alert(s)")
