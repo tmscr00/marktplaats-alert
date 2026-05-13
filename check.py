@@ -1,11 +1,15 @@
 """
 Marktplaats new-listing alerter.
 
-Instead of guessing the internal API's exact parameters, this version
-loads the same HTML page a browser would (the category page with your
-filters) and parses the embedded JSON state Marktplaats injects into
-every page. This means whatever filters work in your browser URL will
-work here, because we ARE the browser URL.
+Loads the same HTML page a browser would and parses the embedded JSON state
+Marktplaats injects into every page, so whatever filters work in your
+browser URL work here.
+
+Two run modes:
+  - default          : real-monitor mode (only alerts on truly new listings)
+  - --test           : force-alert on the most recent listing right now,
+                       regardless of seen.json. Use this to verify the
+                       Telegram pipe end-to-end without waiting.
 """
 
 import json
@@ -18,9 +22,6 @@ import requests
 
 # --- CONFIG -----------------------------------------------------------------
 
-# Your real Marktplaats URL, with the hash-fragment filters converted to
-# regular query parameters (Marktplaats's HTML page understands both).
-# Original link: https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/#offeredSince:Vandaag|postcode:1033SC
 TARGET_URL = (
     "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/"
     "?offeredSince=Vandaag&postcode=1033SC"
@@ -54,10 +55,12 @@ TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID")
 
 
-def tg_send(text: str) -> None:
+def tg_send(text: str) -> bool:
+    """Returns True on success."""
     if not TG_TOKEN or not TG_CHAT:
-        print("WARN: Telegram secrets not set; would have sent:\n", text)
-        return
+        print("WARN: Telegram secrets not set; would have sent:")
+        print(text)
+        return False
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
@@ -71,21 +74,18 @@ def tg_send(text: str) -> None:
         )
         if not r.ok:
             print(f"Telegram error {r.status_code}: {r.text}")
+            return False
+        print(f"Telegram OK ({r.status_code})")
+        return True
     except requests.RequestException as e:
         print(f"Telegram exception: {e}")
+        return False
 
 
 # --- LISTING FETCH ----------------------------------------------------------
 
 
 def fetch_listings_from_page() -> list[dict]:
-    """
-    Fetch the category page HTML and extract the embedded listings JSON.
-
-    Marktplaats injects a __CONFIG__ / __NEXT_DATA__-style blob into every
-    listing page that contains the same data the JSON API returns. By
-    parsing that out, we don't need to know any API param names.
-    """
     r = requests.get(TARGET_URL, headers=HEADERS, timeout=25)
     if not r.ok:
         print(f"HTTP {r.status_code} from page fetch")
@@ -95,8 +95,6 @@ def fetch_listings_from_page() -> list[dict]:
     html = r.text
     print(f"Got {len(html)} bytes of HTML")
 
-    # Try several known embeddings, in order of likelihood.
-    # 1) The custom Marktplaats embed: window.__CONFIG__ = {...};
     m = re.search(r"window\.__CONFIG__\s*=\s*({.+?})\s*;\s*</script>", html, re.DOTALL)
     if m:
         try:
@@ -108,7 +106,6 @@ def fetch_listings_from_page() -> list[dict]:
         except json.JSONDecodeError as e:
             print(f"__CONFIG__ JSON decode failed: {e}")
 
-    # 2) Next.js style: <script id="__NEXT_DATA__" type="application/json">{...}</script>
     m = re.search(
         r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.+?)</script>', html, re.DOTALL
     )
@@ -122,7 +119,6 @@ def fetch_listings_from_page() -> list[dict]:
         except json.JSONDecodeError as e:
             print(f"__NEXT_DATA__ JSON decode failed: {e}")
 
-    # 3) Last resort — any inline JSON containing a "listings" array.
     m = re.search(r'"listings"\s*:\s*(\[[^\[\]]*?\{.+?\}\s*\])', html, re.DOTALL)
     if m:
         try:
@@ -133,17 +129,13 @@ def fetch_listings_from_page() -> list[dict]:
         except json.JSONDecodeError:
             pass
 
-    print("Could not locate listings JSON in the page. Saving first 2000 "
-          "chars of HTML for inspection:")
-    print(html[:2000])
+    print("Could not locate listings JSON in the page.")
     return []
 
 
 def _find_listings_in(obj):
-    """Walk a nested dict/list and return the first 'listings' array found."""
     if isinstance(obj, dict):
         if isinstance(obj.get("listings"), list) and obj["listings"]:
-            # Make sure it looks like ad data, not unrelated lists.
             first = obj["listings"][0]
             if isinstance(first, dict) and ("itemId" in first or "title" in first):
                 return obj["listings"]
@@ -170,8 +162,7 @@ def listing_url(listing: dict) -> str:
         return vip
     if vip:
         return f"https://www.marktplaats.nl{vip}"
-    item_id = listing.get("itemId", "")
-    return f"https://www.marktplaats.nl/v/{item_id}" if item_id else "https://www.marktplaats.nl/"
+    return "https://www.marktplaats.nl/"
 
 
 def price_text(listing: dict) -> str:
@@ -197,7 +188,7 @@ def escape_html(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def format_message(listing: dict) -> str:
+def format_message(listing: dict, prefix: str = "📸") -> str:
     title = escape_html(listing.get("title", "(geen titel)"))
     price = escape_html(price_text(listing))
     loc = escape_html(
@@ -210,7 +201,7 @@ def format_message(listing: dict) -> str:
     )
     url = listing_url(listing)
     return (
-        f"📸 <b>{title}</b>\n"
+        f"{prefix} <b>{title}</b>\n"
         f"💶 {price}\n"
         f"📍 {loc}  ·  👤 {seller}\n"
         f"<a href=\"{url}\">Bekijk advertentie</a>"
@@ -236,22 +227,30 @@ def save_seen(ids: list[str]) -> None:
 # --- MAIN -------------------------------------------------------------------
 
 
-def main() -> int:
-    try:
-        listings = fetch_listings_from_page()
-    except Exception as e:
-        print(f"Fetch failed: {e}")
+def run_test_mode(listings: list[dict]) -> int:
+    """Force-alert on the first organic listing, regardless of seen-state."""
+    print("=== TEST MODE ===")
+    print(f"Telegram token set: {bool(TG_TOKEN)}")
+    print(f"Telegram chat set:  {bool(TG_CHAT)}")
+
+    target = next((l for l in listings if is_real_new(l)), None)
+    if not target:
+        print("No organic listings found to test with.")
         return 1
 
-    if not listings:
-        print("No listings extracted; aborting this run (will retry on next schedule).")
-        return 1
+    print(f"Sending test alert for itemId={target.get('itemId')}: "
+          f"{target.get('title', '')[:60]}")
+    ok = tg_send(format_message(target, prefix="🧪 TEST:"))
+    return 0 if ok else 1
 
-    print(f"Working with {len(listings)} listings")
 
+def run_normal_mode(listings: list[dict]) -> int:
     first_run = not SEEN_FILE.exists()
+    print(f"first_run={first_run}, seen.json exists={SEEN_FILE.exists()}")
+
     seen = load_seen()
     seen_set = set(seen)
+    print(f"Loaded {len(seen)} IDs from seen.json")
 
     new_listings = []
     for l in listings:
@@ -283,6 +282,26 @@ def main() -> int:
 
     save_seen(seen)
     return 0
+
+
+def main() -> int:
+    test_mode = "--test" in sys.argv
+
+    try:
+        listings = fetch_listings_from_page()
+    except Exception as e:
+        print(f"Fetch failed: {e}")
+        return 1
+
+    if not listings:
+        print("No listings extracted; aborting.")
+        return 1
+
+    print(f"Working with {len(listings)} listings")
+
+    if test_mode:
+        return run_test_mode(listings)
+    return run_normal_mode(listings)
 
 
 if __name__ == "__main__":
