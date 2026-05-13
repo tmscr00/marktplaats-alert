@@ -152,8 +152,34 @@ def _find_listings_in(obj):
 
 
 def is_real_new(listing: dict) -> bool:
+    """
+    Return True only if the listing looks like a normal organic post.
+
+    Rejects:
+      - Admarkt paid ads: itemId starts with 'a' (real ads start with 'm'),
+        and/or traits contain 'ADMARKT_*' tokens
+      - Dagtopper / Topadvertentie bumps: priorityProduct != NONE
+      - PACKAGE_PREMIUM / PACKAGE_PLUS — these are paid seller subscriptions
+        that always promote your listing; usually accompany DAGTOPPER but we
+        check separately as a safety net
+    """
+    item_id = str(listing.get("itemId") or "")
+    if not item_id.startswith("m"):
+        return False  # 'a...' = Admarkt, anything else = unknown, reject
+
     pp = listing.get("priorityProduct", "NONE")
-    return pp in ("NONE", None, "")
+    if pp not in ("NONE", None, ""):
+        return False  # DAGTOPPER, TOPADVERTENTIE, etc.
+
+    traits = listing.get("traits") or []
+    bad_traits = {
+        "ADMARKT_CONSOLE", "ADMARKT", "DAG_TOPPER", "DAG_TOPPER_7DAYS",
+        "TOPADVERTENTIE", "PROFILE",
+    }
+    if any(t in bad_traits for t in traits):
+        return False
+
+    return True
 
 
 def listing_url(listing: dict) -> str:
@@ -229,58 +255,35 @@ def save_seen(ids: list[str]) -> None:
 
 def run_test_mode(listings: list[dict]) -> int:
     """
-    Diagnostic dump: print the structure of the top listings so we can
-    identify every field that flags an ad as paid/promoted, then refine
-    the is_real_new() filter accordingly. No Telegram messages are sent.
+    Find the first listing that survives the (now stricter) filter and
+    send it via Telegram, regardless of seen.json state. Use this to
+    verify both Telegram delivery AND that the paid-ad filter works.
     """
-    print("=== DIAGNOSTIC DUMP ===")
-    print(f"Total listings: {len(listings)}")
-    print()
+    print("=== TEST MODE ===")
+    print(f"Telegram token set: {bool(TG_TOKEN)}")
+    print(f"Telegram chat set:  {bool(TG_CHAT)}")
 
-    # Fields that historically have indicated "paid / promoted" on Marktplaats.
-    flag_fields = [
-        "priorityProduct",
-        "priorityProductFeature",
-        "sellerInformation",
-        "verticals",
-        "extendedAttributes",
-        "categorySpecificProperties",
-        "traits",
-        "listingType",
-        "adType",
-        "isDagtopper",
-        "isTopadvertentie",
-        "isFeatured",
-        "isPromoted",
-        "isSponsored",
-        "promotional",
-        "feature",
-        "features",
-        "labels",
-        "badge",
-        "badges",
-        "categoryId",
-    ]
+    # Show what's being filtered so we can see the filter in action.
+    print("\nFilter walk-through:")
+    target = None
+    for i, l in enumerate(listings):
+        item_id = str(l.get("itemId") or "")
+        pp = l.get("priorityProduct", "NONE")
+        traits = l.get("traits") or []
+        ok = is_real_new(l)
+        status = "✅ KEEP" if ok else "❌ skip"
+        print(f"  {i+1:2d}. {status}  id={item_id}  pp={pp}  traits={traits[:3]}")
+        if ok and target is None:
+            target = l
 
-    for i, l in enumerate(listings[:5]):
-        print(f"--- Listing {i+1} ---")
-        print(f"itemId : {l.get('itemId')}")
-        print(f"title  : {l.get('title', '')[:70]}")
-        print(f"date   : {l.get('date')}")
-        print(f"vipUrl : {l.get('vipUrl', '')[:90]}")
-        print("Possible-flag fields present on this listing:")
-        for f in flag_fields:
-            if f in l:
-                val = l[f]
-                if isinstance(val, (dict, list)):
-                    val_str = json.dumps(val)[:200]
-                else:
-                    val_str = str(val)[:200]
-                print(f"  {f} = {val_str}")
-        print(f"All top-level keys: {sorted(l.keys())}")
-        print()
+    if not target:
+        print("\nNo organic listings on this page right now (everything is "
+              "paid/promoted). Try again in a few minutes.")
+        return 1
 
-    return 0
+    print(f"\nSending test alert for itemId={target.get('itemId')}")
+    ok = tg_send(format_message(target, prefix="🧪 TEST:"))
+    return 0 if ok else 1
 
 
 def run_normal_mode(listings: list[dict]) -> int:
