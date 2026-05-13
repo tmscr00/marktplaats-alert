@@ -228,20 +228,59 @@ def save_seen(ids: list[str]) -> None:
 
 
 def run_test_mode(listings: list[dict]) -> int:
-    """Force-alert on the first organic listing, regardless of seen-state."""
-    print("=== TEST MODE ===")
-    print(f"Telegram token set: {bool(TG_TOKEN)}")
-    print(f"Telegram chat set:  {bool(TG_CHAT)}")
+    """
+    Diagnostic dump: print the structure of the top listings so we can
+    identify every field that flags an ad as paid/promoted, then refine
+    the is_real_new() filter accordingly. No Telegram messages are sent.
+    """
+    print("=== DIAGNOSTIC DUMP ===")
+    print(f"Total listings: {len(listings)}")
+    print()
 
-    target = next((l for l in listings if is_real_new(l)), None)
-    if not target:
-        print("No organic listings found to test with.")
-        return 1
+    # Fields that historically have indicated "paid / promoted" on Marktplaats.
+    flag_fields = [
+        "priorityProduct",
+        "priorityProductFeature",
+        "sellerInformation",
+        "verticals",
+        "extendedAttributes",
+        "categorySpecificProperties",
+        "traits",
+        "listingType",
+        "adType",
+        "isDagtopper",
+        "isTopadvertentie",
+        "isFeatured",
+        "isPromoted",
+        "isSponsored",
+        "promotional",
+        "feature",
+        "features",
+        "labels",
+        "badge",
+        "badges",
+        "categoryId",
+    ]
 
-    print(f"Sending test alert for itemId={target.get('itemId')}: "
-          f"{target.get('title', '')[:60]}")
-    ok = tg_send(format_message(target, prefix="🧪 TEST:"))
-    return 0 if ok else 1
+    for i, l in enumerate(listings[:5]):
+        print(f"--- Listing {i+1} ---")
+        print(f"itemId : {l.get('itemId')}")
+        print(f"title  : {l.get('title', '')[:70]}")
+        print(f"date   : {l.get('date')}")
+        print(f"vipUrl : {l.get('vipUrl', '')[:90]}")
+        print("Possible-flag fields present on this listing:")
+        for f in flag_fields:
+            if f in l:
+                val = l[f]
+                if isinstance(val, (dict, list)):
+                    val_str = json.dumps(val)[:200]
+                else:
+                    val_str = str(val)[:200]
+                print(f"  {f} = {val_str}")
+        print(f"All top-level keys: {sorted(l.keys())}")
+        print()
+
+    return 0
 
 
 def run_normal_mode(listings: list[dict]) -> int:
