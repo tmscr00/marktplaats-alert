@@ -1,19 +1,9 @@
 """
 Marktplaats new-listing alerter.
 
-Calls the Marktplaats internal JSON API (/lrp/api/search) with a minimal,
-known-good set of parameters and does all "organic only" filtering on the
-response in Python. This avoids fragility from guessing the API's exact
-filter param names.
-
-For each fetched listing we:
-  - drop bumped / dagtopper / priority ads (priorityProduct != NONE)
-  - skip anything we've already alerted on (seen.json)
-Then push the truly new ones to Telegram.
-
-Because we sort by recency on the API side (default) and the script runs
-every 5 minutes, we don't need a date filter — the seen-IDs file is what
-guarantees we only ever ping you about ads we haven't seen before.
+Calls the Marktplaats internal JSON API and pushes new (non-bumped) listings
+to Telegram. This version is verbose on errors so we can see exactly what
+Marktplaats complains about if the request is rejected.
 """
 
 import json
@@ -25,28 +15,35 @@ import requests
 
 # --- CONFIG -----------------------------------------------------------------
 
-# Built from the user's link:
-# https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/#offeredSince:Vandaag|postcode:1033SC
 SEARCH_PARAMS = {
     "l1CategoryId": 322,   # Audio, tv en foto
     "l2CategoryId": 484,   # Fotocamera's | Digitaal
-    "limit": 30,
-    "offset": 0,
+    "limit": "30",
+    "offset": "0",
 }
 
 API_URL = "https://www.marktplaats.nl/lrp/api/search"
 SEEN_FILE = Path("seen.json")
-MAX_SEEN = 500           # cap so seen.json stays small
-MAX_ALERTS_PER_RUN = 15  # safety cap on a single Telegram burst
+MAX_SEEN = 500
+MAX_ALERTS_PER_RUN = 15
 
+# Full browser-like header set. Marktplaats appears to validate these
+# (sec-fetch-* in particular) on the /lrp/api/search endpoint.
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json",
-    "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
-    "Referer": "https://www.marktplaats.nl/",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
 }
 
 # --- TELEGRAM ---------------------------------------------------------------
@@ -79,15 +76,36 @@ def tg_send(text: str) -> None:
 # --- LISTING FETCH ----------------------------------------------------------
 
 
-def fetch_listings() -> list[dict]:
-    r = requests.get(API_URL, params=SEARCH_PARAMS, headers=HEADERS, timeout=20)
-    r.raise_for_status()
+def fetch_listings_via_api() -> list[dict]:
+    """Try the internal JSON endpoint."""
+    s = requests.Session()
+    s.headers.update(HEADERS)
+
+    # Warm the session by hitting the category page first to pick up cookies.
+    # Some endpoints reject "cold" requests with no consent cookies set.
+    try:
+        s.get(
+            "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/",
+            timeout=20,
+            allow_redirects=True,
+        )
+    except requests.RequestException as e:
+        print(f"Warm-up request failed (non-fatal): {e}")
+
+    r = s.get(API_URL, params=SEARCH_PARAMS, timeout=20)
+    if not r.ok:
+        # Show what the server actually said before we raise.
+        print(f"HTTP {r.status_code} from API")
+        print(f"Final URL: {r.url}")
+        print(f"Response headers: {dict(r.headers)}")
+        body = r.text[:1500]
+        print(f"Response body (first 1500 chars):\n{body}")
+        r.raise_for_status()
     data = r.json()
     return data.get("listings", [])
 
 
 def is_real_new(listing: dict) -> bool:
-    """Skip bumped / paid-priority ads."""
     pp = listing.get("priorityProduct", "NONE")
     return pp in ("NONE", None, "")
 
@@ -163,7 +181,7 @@ def save_seen(ids: list[str]) -> None:
 
 def main() -> int:
     try:
-        listings = fetch_listings()
+        listings = fetch_listings_via_api()
     except Exception as e:
         print(f"Fetch failed: {e}")
         return 1
@@ -180,7 +198,6 @@ def main() -> int:
         if not item_id or item_id in seen_set:
             continue
         if not is_real_new(l):
-            # Mark as seen so we don't reconsider next run, but don't alert.
             seen.append(item_id)
             seen_set.add(item_id)
             continue
@@ -188,13 +205,11 @@ def main() -> int:
         seen.append(item_id)
         seen_set.add(item_id)
 
-    # First-run protection: don't spam every ad currently on page 1.
     if first_run:
         print("First run — seeding seen.json without sending alerts.")
         save_seen(seen)
         return 0
 
-    # Oldest first so notifications arrive chronologically.
     new_listings.reverse()
 
     if len(new_listings) > MAX_ALERTS_PER_RUN:
