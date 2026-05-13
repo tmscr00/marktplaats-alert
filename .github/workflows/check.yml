@@ -2,18 +2,24 @@ name: Marktplaats alert
 
 on:
   schedule:
-    # Every 5 minutes — GitHub Actions' minimum interval on free tier.
-    # Note: scheduled runs can be delayed by several minutes during high load.
     - cron: "*/5 * * * *"
-  workflow_dispatch: {}  # also lets you trigger manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "Send a test alert for the most recent listing (yes/no)"
+        required: false
+        default: "no"
+        type: choice
+        options:
+          - "no"
+          - "yes"
 
-# Prevent overlapping runs (e.g. if a check is slow).
 concurrency:
   group: marktplaats-alert
   cancel-in-progress: false
 
 permissions:
-  contents: write  # needed to commit seen.json back to the repo
+  contents: write
 
 jobs:
   check:
@@ -34,16 +40,23 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python check.py
+        run: |
+          if [[ "${{ inputs.test_mode }}" == "yes" ]]; then
+            python check.py --test
+          else
+            python check.py
+          fi
 
       - name: Commit updated seen.json
+        # Skip the commit step when running in test mode so it doesn't
+        # touch your seen.json state.
+        if: ${{ inputs.test_mode != 'yes' }}
         run: |
           if [[ -n "$(git status --porcelain seen.json)" ]]; then
             git config user.name  "marktplaats-bot"
             git config user.email "marktplaats-bot@users.noreply.github.com"
             git add seen.json
             git commit -m "update seen.json [skip ci]"
-            # Retry once on a race with a parallel/late run.
             git pull --rebase || true
             git push
           else
