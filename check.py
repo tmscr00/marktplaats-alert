@@ -366,12 +366,13 @@ def one_check() -> int:
           f"filtered-as-paid: {filtered_out}, "
           f"candidates-for-verify: {len(new_listings)}")
 
+    # No more "silent first run" — if seen.json is empty/missing, treat that
+    # the same as a normal run. Today's listings still go through verify_today,
+    # so genuine new ones DO trigger Telegram instead of being silently
+    # absorbed. Non-today listings still get added to seen (via verify
+    # returning "not_today") so they won't fire later either.
     if first_run:
-        print("  first run — seeding seen.json without sending alerts.")
-        # On first run, also seed the candidates so we don't spam later.
-        seen.extend(candidate_ids)
-        save_seen(seen)
-        return 0
+        print("  first run — will verify all candidates (no silent seeding).")
 
     new_listings.reverse()
     if len(new_listings) > MAX_ALERTS_PER_RUN:
