@@ -1,13 +1,16 @@
 """
 Marktplaats new-listing alerter.
 
-Calls the Marktplaats internal JSON API and pushes new (non-bumped) listings
-to Telegram. This version is verbose on errors so we can see exactly what
-Marktplaats complains about if the request is rejected.
+Instead of guessing the internal API's exact parameters, this version
+loads the same HTML page a browser would (the category page with your
+filters) and parses the embedded JSON state Marktplaats injects into
+every page. This means whatever filters work in your browser URL will
+work here, because we ARE the browser URL.
 """
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -15,35 +18,34 @@ import requests
 
 # --- CONFIG -----------------------------------------------------------------
 
-SEARCH_PARAMS = {
-    "l1CategoryId": 322,   # Audio, tv en foto
-    "l2CategoryId": 484,   # Fotocamera's | Digitaal
-    "limit": "30",
-    "offset": "0",
-}
+# Your real Marktplaats URL, with the hash-fragment filters converted to
+# regular query parameters (Marktplaats's HTML page understands both).
+# Original link: https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/#offeredSince:Vandaag|postcode:1033SC
+TARGET_URL = (
+    "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/"
+    "?offeredSince=Vandaag&postcode=1033SC"
+)
 
-API_URL = "https://www.marktplaats.nl/lrp/api/search"
 SEEN_FILE = Path("seen.json")
 MAX_SEEN = 500
 MAX_ALERTS_PER_RUN = 15
 
-# Full browser-like header set. Marktplaats appears to validate these
-# (sec-fetch-* in particular) on the /lrp/api/search endpoint.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/plain, */*",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
     "Accept-Language": "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 # --- TELEGRAM ---------------------------------------------------------------
@@ -76,33 +78,85 @@ def tg_send(text: str) -> None:
 # --- LISTING FETCH ----------------------------------------------------------
 
 
-def fetch_listings_via_api() -> list[dict]:
-    """Try the internal JSON endpoint."""
-    s = requests.Session()
-    s.headers.update(HEADERS)
+def fetch_listings_from_page() -> list[dict]:
+    """
+    Fetch the category page HTML and extract the embedded listings JSON.
 
-    # Warm the session by hitting the category page first to pick up cookies.
-    # Some endpoints reject "cold" requests with no consent cookies set.
-    try:
-        s.get(
-            "https://www.marktplaats.nl/l/audio-tv-en-foto/fotocamera-s-digitaal/",
-            timeout=20,
-            allow_redirects=True,
-        )
-    except requests.RequestException as e:
-        print(f"Warm-up request failed (non-fatal): {e}")
-
-    r = s.get(API_URL, params=SEARCH_PARAMS, timeout=20)
+    Marktplaats injects a __CONFIG__ / __NEXT_DATA__-style blob into every
+    listing page that contains the same data the JSON API returns. By
+    parsing that out, we don't need to know any API param names.
+    """
+    r = requests.get(TARGET_URL, headers=HEADERS, timeout=25)
     if not r.ok:
-        # Show what the server actually said before we raise.
-        print(f"HTTP {r.status_code} from API")
-        print(f"Final URL: {r.url}")
-        print(f"Response headers: {dict(r.headers)}")
-        body = r.text[:1500]
-        print(f"Response body (first 1500 chars):\n{body}")
+        print(f"HTTP {r.status_code} from page fetch")
+        print(f"Response body (first 600 chars):\n{r.text[:600]}")
         r.raise_for_status()
-    data = r.json()
-    return data.get("listings", [])
+
+    html = r.text
+    print(f"Got {len(html)} bytes of HTML")
+
+    # Try several known embeddings, in order of likelihood.
+    # 1) The custom Marktplaats embed: window.__CONFIG__ = {...};
+    m = re.search(r"window\.__CONFIG__\s*=\s*({.+?})\s*;\s*</script>", html, re.DOTALL)
+    if m:
+        try:
+            cfg = json.loads(m.group(1))
+            listings = _find_listings_in(cfg)
+            if listings:
+                print(f"Extracted {len(listings)} listings from __CONFIG__")
+                return listings
+        except json.JSONDecodeError as e:
+            print(f"__CONFIG__ JSON decode failed: {e}")
+
+    # 2) Next.js style: <script id="__NEXT_DATA__" type="application/json">{...}</script>
+    m = re.search(
+        r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.+?)</script>', html, re.DOTALL
+    )
+    if m:
+        try:
+            cfg = json.loads(m.group(1))
+            listings = _find_listings_in(cfg)
+            if listings:
+                print(f"Extracted {len(listings)} listings from __NEXT_DATA__")
+                return listings
+        except json.JSONDecodeError as e:
+            print(f"__NEXT_DATA__ JSON decode failed: {e}")
+
+    # 3) Last resort — any inline JSON containing a "listings" array.
+    m = re.search(r'"listings"\s*:\s*(\[[^\[\]]*?\{.+?\}\s*\])', html, re.DOTALL)
+    if m:
+        try:
+            listings = json.loads(m.group(1))
+            if isinstance(listings, list) and listings:
+                print(f"Extracted {len(listings)} listings via regex fallback")
+                return listings
+        except json.JSONDecodeError:
+            pass
+
+    print("Could not locate listings JSON in the page. Saving first 2000 "
+          "chars of HTML for inspection:")
+    print(html[:2000])
+    return []
+
+
+def _find_listings_in(obj):
+    """Walk a nested dict/list and return the first 'listings' array found."""
+    if isinstance(obj, dict):
+        if isinstance(obj.get("listings"), list) and obj["listings"]:
+            # Make sure it looks like ad data, not unrelated lists.
+            first = obj["listings"][0]
+            if isinstance(first, dict) and ("itemId" in first or "title" in first):
+                return obj["listings"]
+        for v in obj.values():
+            found = _find_listings_in(v)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_listings_in(v)
+            if found:
+                return found
+    return None
 
 
 def is_real_new(listing: dict) -> bool:
@@ -114,7 +168,10 @@ def listing_url(listing: dict) -> str:
     vip = listing.get("vipUrl") or ""
     if vip.startswith("http"):
         return vip
-    return f"https://www.marktplaats.nl{vip}"
+    if vip:
+        return f"https://www.marktplaats.nl{vip}"
+    item_id = listing.get("itemId", "")
+    return f"https://www.marktplaats.nl/v/{item_id}" if item_id else "https://www.marktplaats.nl/"
 
 
 def price_text(listing: dict) -> str:
@@ -181,12 +238,16 @@ def save_seen(ids: list[str]) -> None:
 
 def main() -> int:
     try:
-        listings = fetch_listings_via_api()
+        listings = fetch_listings_from_page()
     except Exception as e:
         print(f"Fetch failed: {e}")
         return 1
 
-    print(f"Fetched {len(listings)} listings from API")
+    if not listings:
+        print("No listings extracted; aborting this run (will retry on next schedule).")
+        return 1
+
+    print(f"Working with {len(listings)} listings")
 
     first_run = not SEEN_FILE.exists()
     seen = load_seen()
