@@ -161,8 +161,15 @@ def _find_listings_in(obj):
 # --- FILTER -----------------------------------------------------------------
 
 
+# Map Dutch short month names to numbers.
+DUTCH_MONTHS = {
+    "jan": 1, "feb": 2, "mrt": 3, "apr": 4, "mei": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "okt": 10, "nov": 11, "dec": 12,
+}
+
+
 def is_real_new(listing: dict) -> bool:
-    """Reject Admarkt + Dagtopper + Topadvertentie + anything tagged paid."""
+    """First-pass filter: reject Admarkt + Dagtopper + paid traits."""
     item_id = str(listing.get("itemId") or "")
     if not item_id.startswith("m"):
         return False
@@ -180,6 +187,57 @@ def is_real_new(listing: dict) -> bool:
         return False
 
     return True
+
+
+def verify_posted_today(listing: dict) -> bool:
+    """
+    Second-pass filter: fetch the listing's own page and read the
+    'Sinds DD mmm '26' line. The page-list 'date' field shows when an
+    ad was last bumped, not posted, so we can't trust it. Returns True
+    only if the listing's actual creation date is today.
+
+    One HTTP request per genuinely-new listing (after seen.json dedup),
+    so cost is small.
+    """
+    vip = listing.get("vipUrl") or ""
+    if not vip:
+        return False
+    url = vip if vip.startswith("http") else f"https://www.marktplaats.nl{vip}"
+
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        print(f"     verify-date fetch failed for {listing.get('itemId')}: {e}")
+        return False
+
+    # Look for "Sinds 12 mei '26" or "Sinds 12 mei 2026"
+    m = re.search(r"Sinds\s+(\d{1,2})\s+([a-z]{3,4})\s+'?(\d{2,4})", r.text, re.IGNORECASE)
+    if not m:
+        print(f"     verify-date: could not find 'Sinds' line for {listing.get('itemId')}")
+        return False
+
+    day = int(m.group(1))
+    month_name = m.group(2).lower()[:3]
+    year_raw = m.group(3)
+    year = int(year_raw) if len(year_raw) == 4 else 2000 + int(year_raw)
+    month = DUTCH_MONTHS.get(month_name)
+    if month is None:
+        print(f"     verify-date: unknown month '{month_name}' for {listing.get('itemId')}")
+        return False
+
+    # Compare with today (in NL local time = UTC+1 or +2; use UTC since the
+    # difference doesn't matter on the day boundary unless we run at midnight,
+    # and we just check the date once anyway).
+    from datetime import datetime, timezone, timedelta
+    nl_now = datetime.now(timezone.utc) + timedelta(hours=2)  # CEST in May
+    today = (nl_now.year, nl_now.month, nl_now.day)
+    listing_date = (year, month, day)
+    is_today = listing_date == today
+    if not is_today:
+        print(f"     verify-date: {listing.get('itemId')} posted "
+              f"{listing_date}, not today {today} — skipping")
+    return is_today
 
 
 # --- FORMAT -----------------------------------------------------------------
@@ -292,16 +350,27 @@ def one_check() -> int:
     if len(new_listings) > MAX_ALERTS_PER_RUN:
         new_listings = new_listings[-MAX_ALERTS_PER_RUN:]
 
-    if new_listings:
-        print(f"  📨 sending {len(new_listings)} alert(s)")
-        for l in new_listings:
+    # Second-pass: verify each candidate was actually posted TODAY by
+    # looking at its own listing page (the page-list date is when it was
+    # last bumped, not when posted, so we can't trust it).
+    verified = []
+    for l in new_listings:
+        if verify_posted_today(l):
+            verified.append(l)
+
+    if verified:
+        print(f"  📨 sending {len(verified)} alert(s) (of {len(new_listings)} candidates)")
+        for l in verified:
             ok = tg_send(format_message(l))
             print(f"     - {l.get('itemId')} {'✅' if ok else '❌'} {l.get('title','')[:50]}")
     else:
-        print("  nothing new")
+        if new_listings:
+            print(f"  {len(new_listings)} new-to-us listings but none verified as posted today")
+        else:
+            print("  nothing new")
 
     save_seen(seen)
-    return len(new_listings)
+    return len(verified)
 
 
 def run_test_mode() -> int:
@@ -311,17 +380,33 @@ def run_test_mode() -> int:
         print("no listings.")
         return 1
     print(f"\nFilter walk-through ({len(listings)} listings):")
-    target = None
+    kept = []
     for i, l in enumerate(listings):
         ok = is_real_new(l)
         status = "✅ KEEP" if ok else "❌ skip"
+        date = (l.get("date") or "")[:20]
         print(f"  {i+1:2d}. {status}  id={l.get('itemId')}  "
-              f"pp={l.get('priorityProduct')}  traits={(l.get('traits') or [])[:3]}")
-        if ok and target is None:
-            target = l
-    if not target:
-        print("\nNo organic listings on these pages right now.")
+              f"pp={l.get('priorityProduct')}  date={date}  "
+              f"traits={(l.get('traits') or [])[:3]}")
+        if ok:
+            kept.append(l)
+
+    print(f"\n{len(kept)} listings passed the filter.")
+    if kept:
+        print("\nFull data for each KEPT listing (so we can spot any that shouldn't pass):")
+        for l in kept[:5]:
+            print(f"\n  itemId  : {l.get('itemId')}")
+            print(f"  title   : {l.get('title','')[:70]}")
+            print(f"  date    : {l.get('date')}")
+            print(f"  pp      : {l.get('priorityProduct')}")
+            print(f"  traits  : {l.get('traits')}")
+            print(f"  seller  : {(l.get('sellerInformation') or {}).get('sellerName')}")
+            print(f"  vipUrl  : {l.get('vipUrl','')[:90]}")
+
+    if not kept:
+        print("\nNo organic listings to test with right now.")
         return 1
+    target = kept[0]
     print(f"\nSending test alert for itemId={target.get('itemId')}")
     ok = tg_send(format_message(target, prefix="🧪 TEST:"))
     return 0 if ok else 1
