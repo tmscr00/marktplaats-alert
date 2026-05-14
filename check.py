@@ -36,6 +36,12 @@ CATEGORIES = [
         "pages": 5,
     },
     {
+        "label": "Videocamera",
+        "emoji": "🎥",
+        "base": "https://www.marktplaats.nl/l/audio-tv-en-foto/videocamera-s-digitaal/",
+        "pages": 3,
+    },
+    {
         "label": "iPod",
         "emoji": "🎧",
         "base": "https://www.marktplaats.nl/l/audio-tv-en-foto/mp3-spelers-apple-ipod/",
